@@ -1,0 +1,348 @@
+# RDS Guard
+
+FM radio traffic and emergency monitoring for Sweden. Decodes RDS data from an RTL-SDR dongle, captures traffic announcements and emergency broadcasts, and serves a live web dashboard.
+
+Built for Sveriges Radio P4, Sweden's primary traffic announcement carrier and emergency broadcast channel (VMA).
+
+## What it does
+
+- Tunes to an FM frequency using an RTL-SDR USB dongle
+- Decodes all RDS (Radio Data System) data in real time
+- Detects traffic announcements, emergency broadcasts, TMC messages, and EON cross-network alerts
+- Stores events in a local SQLite database with 30-day retention
+- Serves a dark-themed web dashboard with live event feed and raw console
+- Optionally forwards events and decoded data to an MQTT broker for Home Assistant or other automation
+
+## Architecture
+
+Single Docker container. One process handles the entire pipeline:
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  rds-guard container                                     │
+│                                                          │
+│  rtl_fm │ redsea │ rds_guard.py                          │
+│                        │                                 │
+│                   ┌────┴────┐                            │
+│                   │  Rules  │                            │
+│                   │  Engine │                            │
+│                   └──┬───┬──┘                            │
+│               ┌──────┘   └──────┐                        │
+│               ▼                 ▼                        │
+│           SQLite            MQTT publisher               │
+│         /data/events.db     (optional)                   │
+│               │                                          │
+│               ▼                                          │
+│         Web server (aiohttp)                             │
+│           ├── GET  /              → web UI               │
+│           ├── GET  /api/events    → query events         │
+│           ├── GET  /api/status    → decoder status       │
+│           └── WS   /ws/console   → live message stream   │
+│               │                                          │
+├───────────────┼──────────────────────────────────────────┤
+│           port 8022                                      │
+└───────────────┼──────────────────────────────────────────┘
+                ▼
+             Browser
+```
+
+**Pipeline:** `rtl_fm` demodulates the FM signal, `redsea` decodes RDS groups to JSON, `rds_guard.py` processes everything.
+
+**Rules engine** evaluates each decoded group against hardcoded rules defined by the RDS standard:
+
+| Trigger | Event type | Severity |
+|---------|------------|----------|
+| TA flag goes true | `traffic` | `warning` |
+| TA flag goes false (end) | `traffic` | `info` |
+| RadioText change during active TA | updates existing event | |
+| PTY changes to Alarm | `emergency` | `critical` |
+| TMC message (group 8A) | `tmc` | `warning` |
+| EON linked station TA (group 14A) | `eon_traffic` | `info` |
+
+Events are written to SQLite and optionally published to MQTT. Traffic announcements are tracked through their full lifecycle (start, RadioText updates, end with duration).
+
+## Requirements
+
+- Linux host (Raspberry Pi, NAS, server)
+- RTL-SDR USB dongle (RTL2832U-based)
+- Docker and Docker Compose
+- FM antenna with line of sight to a P4 transmitter
+
+### Host preparation
+
+Blacklist the default DVB kernel driver so the RTL-SDR is available to the container:
+
+```bash
+echo "blacklist dvb_usb_rtl28xxu" | sudo tee /etc/modprobe.d/blacklist-rtlsdr.conf
+sudo modprobe -r dvb_usb_rtl28xxu
+```
+
+## Quick start
+
+1. Clone the repository and enter the directory:
+
+```bash
+cd rds-guard
+```
+
+2. Edit `.env` to match your setup. At minimum, set your FM frequency:
+
+```bash
+FM_FREQUENCY=103.3M        # Your local P4 frequency
+```
+
+If you want MQTT forwarding, enable it and configure the broker:
+
+```bash
+MQTT_ENABLED=true              # Enable MQTT (default: false)
+MQTT_HOST=192.168.1.100        # Your MQTT broker IP
+MQTT_PORT=1883
+```
+
+3. Build and start:
+
+```bash
+docker compose up -d
+```
+
+4. Open the web UI at **http://your-host:8022**
+
+5. View logs:
+
+```bash
+docker compose logs -f rds-guard
+```
+
+## Configuration
+
+All settings are in the `.env` file:
+
+### RTL-SDR
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FM_FREQUENCY` | `103.5M` | FM frequency to tune (P4 Varmland) |
+| `RTL_GAIN` | `8` | Tuner gain in dB (0-50) |
+| `PPM_CORRECTION` | `0` | Frequency correction for your dongle |
+| `RTL_DEVICE_INDEX` | `0` | Device index if multiple dongles |
+| `RTL_DEVICE_SERIAL` | | Select dongle by serial number instead of index |
+
+### MQTT (optional)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MQTT_ENABLED` | `false` | Enable MQTT publishing (`true`/`false`) |
+| `MQTT_HOST` | | Broker hostname/IP |
+| `MQTT_PORT` | `1883` | Broker port |
+| `MQTT_USER` | | Username (optional) |
+| `MQTT_PASSWORD` | | Password (optional) |
+| `MQTT_TOPIC_PREFIX` | `rds` | Base topic prefix |
+| `MQTT_CLIENT_ID` | `rds-guard` | MQTT client ID |
+| `MQTT_QOS` | `1` | Default QoS level |
+| `MQTT_RETAIN_STATE` | `true` | Retain state topics |
+
+### Publishing control
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PUBLISH_MODE` | `essential` | `essential` = traffic, RadioText, PTY, EON TA only. `all` = every decoded RDS field. |
+| `PUBLISH_RAW` | `false` | Publish raw RDS groups to `system/raw` (high volume) |
+| `STATUS_INTERVAL` | `30` | Seconds between status messages |
+
+### Web UI
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WEB_UI_PORT` | `8022` | HTTP port for the web UI and API |
+| `EVENT_RETENTION_DAYS` | `30` | Auto-delete events older than this |
+
+## Web UI
+
+The dashboard has two views:
+
+**Events** — Traffic announcements, emergency broadcasts, and other alerts from the database. Active announcements pulse red. Filter by event type. Polls every 10 seconds.
+
+**Console** — Live stream of all decoded RDS groups via WebSocket. Pause/resume, text filter, 500-message buffer. Useful for debugging and seeing raw data flow.
+
+The status bar at the bottom shows two rows of live data:
+- **Top row:** Station name, PI code, frequency, programme type (PTY), TP/TA flags, pipeline health indicator, decode rate, and uptime
+- **Bottom row:** Current RadioText and now-playing info (artist/title from RT+)
+
+## REST API
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/events` | GET | Query events. Params: `type`, `since`, `limit`, `offset` |
+| `/api/events/active` | GET | In-progress announcements only |
+| `/api/status` | GET | Decoder status (uptime, station info, decode rate) |
+| `/api/events` | DELETE | Clear all events |
+| `/ws/console` | WS | Live stream of all decoded RDS messages |
+
+## MQTT topics
+
+When MQTT is enabled, decoded data is published to structured topics:
+
+```
+rds/{pi}/traffic/ta          # Traffic Announcement active (bool)
+rds/{pi}/traffic/tp          # Traffic Programme flag
+rds/{pi}/programme/rt        # RadioText (64-char free text)
+rds/{pi}/station/pty         # Programme Type
+rds/{pi}/eon/{other_pi}/ta   # Linked station TA via EON
+rds/alert                    # All events (traffic, emergency, tmc, eon)
+rds/system/status            # Bridge health (periodic)
+```
+
+In `all` mode, additional topics are published for PS, AF, clock, RT+, Long PS, ODA, BLER, and more.
+
+## Home Assistant
+
+The MQTT output works directly with Home Assistant. Example configuration:
+
+```yaml
+mqtt:
+  binary_sensor:
+    - name: "P4 Traffic Announcement"
+      state_topic: "rds/0x9E04/traffic/ta"
+      value_template: "{{ value_json.active }}"
+      payload_on: "true"
+      payload_off: "false"
+      device_class: problem
+
+  sensor:
+    - name: "P4 RadioText"
+      state_topic: "rds/0x9E04/programme/rt"
+      value_template: "{{ value_json.radiotext }}"
+      icon: mdi:message-text
+```
+
+Example automation for traffic announcement notifications:
+
+```yaml
+automation:
+  - alias: "Traffic Announcement on P4"
+    trigger:
+      - platform: mqtt
+        topic: "rds/+/traffic/ta"
+    condition:
+      - condition: template
+        value_template: "{{ trigger.payload_json.active == true }}"
+    action:
+      - service: notify.mobile_app
+        data:
+          title: "Traffic announcement on P4"
+          message: "A traffic announcement is being broadcast"
+```
+
+## P4 regional frequencies
+
+P4 is Sweden's primary traffic and emergency broadcast network with 25 regional stations. Set `FM_FREQUENCY` to your local station:
+
+| Station | City | Frequency |
+|---------|------|-----------|
+| P4 Stockholm | Stockholm | 103.3 MHz |
+| P4 Goteborg | Goteborg | 101.9 MHz |
+| P4 Malmohus | Malmo | 102.0 MHz |
+| P4 Uppland | Uppsala | 107.3 MHz |
+| P4 Vastmanland | Vasteras | 100.5 MHz |
+| P4 Orebro | Orebro | 102.8 MHz |
+| P4 Ostergotland | Norrkoping | 94.8 MHz |
+| P4 Sormland | Eskilstuna | 98.3 MHz |
+| P4 Jonkoping | Jonkoping | 100.8 MHz |
+| P4 Halland | Halmstad | 97.3 MHz |
+| P4 Norrbotten | Lulea | 96.9 MHz |
+| P4 Vasterbotten | Umea | 103.6 MHz |
+| P4 Jamtland | Ostersund | 100.4 MHz |
+| P4 Vasternorrland | Sundsvall | 102.8 MHz |
+| P4 Gavleborg | Gavle | 102.0 MHz |
+| P4 Dalarna | Falun | 100.2 MHz |
+| P4 Varmland | Karlstad | 103.5 MHz |
+| P4 Vast | Uddevalla | 103.3 MHz |
+| P4 Sjuharad | Boras | 102.9 MHz |
+| P4 Skaraborg | Skovde | 100.3 MHz |
+| P4 Kronoberg | Vaxjo | 100.2 MHz |
+| P4 Kalmar | Kalmar | 95.6 MHz |
+| P4 Blekinge | Ronneby | 87.8 MHz |
+| P4 Kristianstad | Kristianstad | 101.4 MHz |
+| P4 Gotland | Visby | 102.8 MHz |
+
+Frequencies may vary by relay transmitter. The decoded AF (Alternative Frequencies) data reveals all available frequencies for your station.
+
+## File structure
+
+```
+rds-guard/
+├── Dockerfile
+├── docker-compose.yml
+├── .env
+├── config.py
+├── requirements.txt
+├── entrypoint.sh
+├── rds_guard.py          # Supervisor: rules engine, MQTT, WebSocket hub
+├── pipeline.py           # Subprocess manager for rtl_fm + redsea
+├── event_store.py        # SQLite wrapper
+├── web_server.py         # aiohttp REST API + WebSocket + static serving
+└── static/
+    ├── index.html
+    ├── css/
+    │   └── style.css
+    └── js/
+        ├── app.js        # Tab routing, status bar
+        ├── events.js     # Event cards, filters, polling
+        └── console.js    # WebSocket console, pause/filter
+```
+
+## Operations
+
+### Rebuild and restart
+
+To do a clean rebuild from scratch (wipes the event database):
+
+```bash
+docker compose down -v && docker compose build --no-cache && docker compose up -d && docker compose logs -f
+```
+
+To rebuild without wiping the database (preserves event history):
+
+```bash
+docker compose down && docker compose build --no-cache && docker compose up -d && docker compose logs -f
+```
+
+### View logs
+
+```bash
+docker compose logs -f rds-guard
+```
+
+### Check decoder status
+
+The status API returns pipeline health, station info, decode rate, and uptime:
+
+```bash
+curl http://localhost:8022/api/status
+```
+
+### Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---------|-------------|-----|
+| Web UI loads but shows `---` everywhere | Pipeline hasn't started or RTL-SDR not found | Check logs for `[rtl_fm]` errors. Verify dongle is plugged in and driver is blacklisted |
+| `usb_open error` in logs | Kernel DVB driver still loaded | Run `sudo modprobe -r dvb_usb_rtl28xxu` on the host |
+| `No RTL-SDR devices found` | Dongle not passed to container | Verify `privileged: true` in docker-compose.yml or add the device explicitly |
+| Pipeline status shows `error` | rtl_fm or redsea crashed | Check logs for `[rtl_fm]` / `[redsea]` error lines. Rebuild with `--no-cache` |
+| Events show as "In progress" after restart | Normal — stale events from the previous run | They are automatically closed on startup. Do a clean rebuild with `-v` to clear old data |
+| MQTT not publishing | MQTT disabled or broker unreachable | Set `MQTT_ENABLED=true` in `.env` and verify broker IP/port. Check logs for MQTT connection errors |
+| Low decode rate (< 5 grp/s) | Weak signal or wrong frequency | Try increasing `RTL_GAIN`. Verify `FM_FREQUENCY` matches a nearby P4 transmitter |
+
+## Multiple RTL-SDR dongles
+
+If you have more than one RTL-SDR plugged in, you can select by serial number:
+
+```bash
+RTL_DEVICE_SERIAL=00000002
+```
+
+The pipeline manager resolves the serial to a device index automatically using `rtl_test`.
+
+## License
+
+MIT

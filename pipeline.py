@@ -1,0 +1,332 @@
+"""Radio pipeline manager — spawns and monitors rtl_fm + redsea subprocesses.
+
+This module manages the radio pipeline as two connected subprocesses:
+
+    rtl_fm (stdout=raw IQ) → redsea (stdout=ndjson) → Python callback
+
+No FIFOs, no shell pipes — just subprocess.Popen with stdout=PIPE.
+Each process's stderr is captured by a dedicated reader thread and
+logged to Python logging, making all output visible in docker logs.
+"""
+
+import logging
+import os
+import re
+import subprocess
+import threading
+import time
+
+import config
+
+log = logging.getLogger("rds-guard")
+
+
+# ---------------------------------------------------------------------------
+# Pipeline status — thread-safe state exposed to web UI via /api/status
+# ---------------------------------------------------------------------------
+
+class PipelineStatus:
+    """Thread-safe pipeline health status."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.state = "not_started"  # not_started | starting | running | stopped | error
+        self.error_message = None
+        self.rtl_fm_pid = None
+        self.redsea_pid = None
+        self.started_at = None
+
+    def set_starting(self):
+        with self.lock:
+            self.state = "starting"
+            self.error_message = None
+
+    def set_running(self, rtl_pid, redsea_pid):
+        with self.lock:
+            self.state = "running"
+            self.error_message = None
+            self.rtl_fm_pid = rtl_pid
+            self.redsea_pid = redsea_pid
+            self.started_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+
+    def set_stopped(self, message=None):
+        with self.lock:
+            self.state = "stopped"
+            self.error_message = message
+            self.rtl_fm_pid = None
+            self.redsea_pid = None
+
+    def set_error(self, message):
+        with self.lock:
+            self.state = "error"
+            self.error_message = message
+            self.rtl_fm_pid = None
+            self.redsea_pid = None
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "state": self.state,
+                "error": self.error_message,
+                "rtl_fm_pid": self.rtl_fm_pid,
+                "redsea_pid": self.redsea_pid,
+                "started_at": self.started_at,
+            }
+
+
+# Module-level singleton — importable by web_server and rds_guard
+pipeline_status = PipelineStatus()
+
+
+# ---------------------------------------------------------------------------
+# Command builders
+# ---------------------------------------------------------------------------
+
+def _build_rtl_fm_cmd():
+    """Build the rtl_fm command array from config."""
+    device_index = _resolve_device_serial()
+    cmd = [
+        "rtl_fm",
+        "-M", "fm",
+        "-l", "0",
+        "-A", "std",
+        "-p", str(config.PPM_CORRECTION),
+        "-s", "171k",
+        "-g", str(config.RTL_GAIN),
+        "-F", "9",
+        "-d", str(device_index),
+        "-f", str(config.FM_FREQUENCY),
+    ]
+    return cmd
+
+
+def _build_redsea_cmd():
+    """Build the redsea command array from config."""
+    cmd = [
+        "redsea",
+        "-r", "171k",
+        "-t", "%Y-%m-%dT%H:%M:%S%f",
+    ]
+    if config.REDSEA_SHOW_PARTIAL:
+        cmd.append("-p")
+    if config.REDSEA_SHOW_RAW:
+        cmd.append("-R")
+    cmd.append("-E")
+    return cmd
+
+
+def _resolve_device_serial():
+    """Resolve RTL_DEVICE_SERIAL to a device index via rtl_test.
+
+    Returns the device index (string).  Falls back to RTL_DEVICE_INDEX
+    if no serial is configured or lookup fails.
+    """
+    serial = config.RTL_DEVICE_SERIAL
+    if not serial:
+        return config.RTL_DEVICE_INDEX
+
+    log.info("Resolving RTL-SDR serial '%s' to device index...", serial)
+    try:
+        result = subprocess.run(
+            ["rtl_test"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        # rtl_test outputs to stderr:
+        #   0:  Realtek, RTL2838UHIDIR, SN: 00000001
+        output = result.stdout + result.stderr
+        pattern = rf"^\s*(\d+):.*SN:\s*{re.escape(serial)}"
+        match = re.search(pattern, output, re.MULTILINE | re.IGNORECASE)
+        if match:
+            index = match.group(1)
+            log.info("Resolved serial '%s' → device index %s", serial, index)
+            return index
+        else:
+            log.error("No RTL-SDR device found with serial '%s'", serial)
+            log.error("rtl_test output:\n%s", output.strip())
+            return config.RTL_DEVICE_INDEX  # fall back
+    except FileNotFoundError:
+        log.error("rtl_test not found — cannot resolve device serial")
+        return config.RTL_DEVICE_INDEX
+    except subprocess.TimeoutExpired:
+        log.error("rtl_test timed out — cannot resolve device serial")
+        return config.RTL_DEVICE_INDEX
+    except Exception as e:
+        log.error("Error resolving device serial: %s", e)
+        return config.RTL_DEVICE_INDEX
+
+
+# ---------------------------------------------------------------------------
+# Stderr reader thread — captures subprocess output for docker logs
+# ---------------------------------------------------------------------------
+
+def _stderr_reader(stream, prefix):
+    """Read a subprocess stderr stream line by line and log each line.
+
+    Runs in a daemon thread.  Exits when the stream closes (process dies).
+    """
+    try:
+        for raw_line in iter(stream.readline, b""):
+            text = raw_line.decode("utf-8", errors="replace").rstrip()
+            if text:
+                log.info("[%s] %s", prefix, text)
+    except Exception:
+        pass
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Pipeline runner — main function, designed to run in a thread
+# ---------------------------------------------------------------------------
+
+def run_pipeline(on_line_callback, status, stop_event):
+    """Spawn rtl_fm | redsea and feed redsea's JSON output to the callback.
+
+    Args:
+        on_line_callback: Called with each bytes line from redsea's stdout.
+        status: PipelineStatus instance to update.
+        stop_event: threading.Event — set to request shutdown.
+
+    This function blocks until the pipeline exits or stop_event is set.
+    It does NOT auto-restart.  Docker's restart policy handles that.
+    """
+    rtl_proc = None
+    redsea_proc = None
+
+    try:
+        status.set_starting()
+
+        rtl_cmd = _build_rtl_fm_cmd()
+        redsea_cmd = _build_redsea_cmd()
+
+        log.info("Pipeline starting...")
+        log.info("  rtl_fm:  %s", " ".join(rtl_cmd))
+        log.info("  redsea:  %s", " ".join(redsea_cmd))
+
+        # Spawn rtl_fm: stdout → pipe to redsea, stderr → captured for logging
+        rtl_proc = subprocess.Popen(
+            rtl_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        log.info("rtl_fm started (PID: %d)", rtl_proc.pid)
+
+        # Spawn redsea: stdin ← rtl_fm stdout, stdout → pipe to Python, stderr → captured
+        redsea_proc = subprocess.Popen(
+            redsea_cmd,
+            stdin=rtl_proc.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        log.info("redsea started (PID: %d)", redsea_proc.pid)
+
+        # Close rtl_fm's stdout in the parent process.
+        # This is critical: it ensures redsea gets SIGPIPE if rtl_fm dies,
+        # and rtl_fm gets SIGPIPE if redsea dies.
+        rtl_proc.stdout.close()
+
+        # Start stderr reader threads for both processes
+        rtl_stderr_thread = threading.Thread(
+            target=_stderr_reader,
+            args=(rtl_proc.stderr, "rtl_fm"),
+            daemon=True,
+        )
+        rtl_stderr_thread.start()
+
+        redsea_stderr_thread = threading.Thread(
+            target=_stderr_reader,
+            args=(redsea_proc.stderr, "redsea"),
+            daemon=True,
+        )
+        redsea_stderr_thread.start()
+
+        status.set_running(rtl_proc.pid, redsea_proc.pid)
+        log.info("Pipeline running — reading RDS data...")
+
+        # Start a watchdog thread that kills subprocesses when stop_event is set.
+        # This is necessary because readline() below blocks and cannot be
+        # interrupted.  Killing the subprocesses closes the pipe, which
+        # causes readline() to return b"" (EOF) and exit the loop.
+        def _shutdown_watchdog():
+            stop_event.wait()
+            log.info("Shutdown requested — killing pipeline subprocesses...")
+            _terminate_process(rtl_proc, "rtl_fm")
+            _terminate_process(redsea_proc, "redsea")
+
+        watchdog = threading.Thread(target=_shutdown_watchdog, daemon=True)
+        watchdog.start()
+
+        # Read redsea's stdout line by line (JSON lines).
+        # iter(readline, b"") blocks until data is available, returns b"" on EOF.
+        # EOF occurs when redsea exits (naturally or killed by the watchdog).
+        for raw_line in iter(redsea_proc.stdout.readline, b""):
+            if stop_event.is_set():
+                break
+            on_line_callback(raw_line)
+
+        # If we get here, either stop was requested or redsea's stdout closed
+
+    except FileNotFoundError as e:
+        msg = f"Binary not found: {e.filename}"
+        log.error("Pipeline error: %s", msg)
+        status.set_error(msg)
+        return
+
+    except Exception as e:
+        msg = str(e)
+        log.error("Pipeline error: %s", msg)
+        status.set_error(msg)
+        return
+
+    finally:
+        # Clean up child processes
+        _terminate_process(rtl_proc, "rtl_fm")
+        _terminate_process(redsea_proc, "redsea")
+
+    # Determine exit reason
+    if stop_event.is_set():
+        log.info("Pipeline stopped (shutdown requested)")
+        status.set_stopped("Shutdown requested")
+    else:
+        # Pipeline died on its own — figure out why
+        rtl_code = rtl_proc.returncode if rtl_proc else None
+        redsea_code = redsea_proc.returncode if redsea_proc else None
+
+        if rtl_code is not None and rtl_code != 0:
+            msg = f"rtl_fm exited with code {rtl_code}"
+            log.error("Pipeline failed: %s", msg)
+            status.set_error(msg)
+        elif redsea_code is not None and redsea_code != 0:
+            msg = f"redsea exited with code {redsea_code}"
+            log.error("Pipeline failed: %s", msg)
+            status.set_error(msg)
+        else:
+            log.warning("Pipeline ended unexpectedly")
+            status.set_stopped("Pipeline ended")
+
+
+def _terminate_process(proc, name):
+    """Terminate a subprocess gracefully, then force-kill if needed."""
+    if proc is None:
+        return
+    if proc.poll() is not None:
+        # Already exited
+        return
+    try:
+        log.info("Terminating %s (PID: %d)...", name, proc.pid)
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            log.warning("%s did not exit after SIGTERM, sending SIGKILL", name)
+            proc.kill()
+            proc.wait(timeout=2)
+    except Exception as e:
+        log.warning("Error terminating %s: %s", name, e)
+
+

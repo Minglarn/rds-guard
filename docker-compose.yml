@@ -1,0 +1,12 @@
+services:
+  rds-guard:
+    build: .
+    container_name: rds-guard
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${WEB_UI_PORT:-8022}:8022"
+    volumes:
+      - ./rds-data:/data
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
