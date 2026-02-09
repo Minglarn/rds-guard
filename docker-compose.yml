@@ -1,6 +1,6 @@
 services:
   rds-guard:
-    build: .
+    image: ghcr.io/minglarn/rds-guard:latest
     container_name: rds-guard
     restart: unless-stopped
     env_file: .env
